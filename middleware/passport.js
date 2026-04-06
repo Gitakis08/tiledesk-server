@@ -78,6 +78,84 @@ if (process.env.OAUTH2_SIGNIN_ENABLED == "true" || process.env.OAUTH2_SIGNIN_ENA
 }
 winston.info('Authentication Oauth2 Signin enabled : ' + enableOauth2Signin);
 
+/**
+ * OAuth2 / OIDC scope list: space-separated in OAUTH2_SCOPE, default Entra-friendly scopes.
+ */
+function parseOauth2Scope() {
+    var s = process.env.OAUTH2_SCOPE;
+    if (!s || typeof s !== 'string' || !String(s).trim()) {
+        return ['openid', 'profile', 'email'];
+    }
+    return String(s).trim().split(/\s+/).filter(Boolean);
+}
+
+function oauth2NormalizeEmailLike(v) {
+    if (v === undefined || v === null) {
+        return '';
+    }
+    return String(v).trim().toLowerCase();
+}
+
+/** Display name: `name`, else given_name + family_name, else preferred_username (UserInfo / OIDC). */
+function oauth2DeriveDisplayName(json) {
+    if (!json || typeof json !== 'object') {
+        return '';
+    }
+    var n = json.name != null ? String(json.name).trim() : '';
+    if (n) {
+        return n;
+    }
+    var g = json.given_name != null ? String(json.given_name).trim() : '';
+    var f = json.family_name != null ? String(json.family_name).trim() : '';
+    if (g || f) {
+        return [g, f].filter(Boolean).join(' ').trim();
+    }
+    var u = json.preferred_username != null ? String(json.preferred_username).trim() : '';
+    return u;
+}
+
+/** Build passport `profile` from UserInfo HTTP body (primary source for Entra / OIDC). */
+function oauth2ProfileFromUserInfoBody(body) {
+    var json = JSON.parse(body);
+    var emailRaw = '';
+    if (json.email != null && String(json.email).trim()) {
+        emailRaw = String(json.email).trim();
+    } else if (json.preferred_username != null && String(json.preferred_username).trim()) {
+        emailRaw = String(json.preferred_username).trim();
+    }
+    return {
+        keycloakId: json.sub,
+        fullName: oauth2DeriveDisplayName(json),
+        firstName: json.given_name != null ? String(json.given_name).trim() : '',
+        lastName: json.family_name != null ? String(json.family_name).trim() : '',
+        username: json.preferred_username != null ? String(json.preferred_username).trim() : '',
+        email: oauth2NormalizeEmailLike(emailRaw),
+    };
+}
+
+var oauth2UserProfileInstalled = false;
+
+function installOauth2UserProfileOnce(OAuth2Strategy) {
+    if (oauth2UserProfileInstalled) {
+        return;
+    }
+    oauth2UserProfileInstalled = true;
+    OAuth2Strategy.prototype.userProfile = function (accessToken, done) {
+        this._oauth2._useAuthorizationHeaderForGET = true;
+        this._oauth2.get(process.env.OAUTH2_USER_INFO_URL, accessToken, function (err, body) {
+            if (err) {
+                return done(err);
+            }
+            try {
+                var profile = oauth2ProfileFromUserInfoBody(body);
+                winston.debug('OAuth2 userProfile', profile);
+                done(null, profile);
+            } catch (e) {
+                done(e);
+            }
+        });
+    };
+}
 
 var jwthistory = undefined;
 try {
@@ -536,58 +614,8 @@ module.exports = function (passport) {
 
     if (enableOauth2Signin == true) {
 
-        const OAuth2Strategy = require('passport-oauth2');
-        OAuth2Strategy.prototype.userProfile = function (accessToken, done) {
-
-            winston.debug("accessToken " + accessToken)
-
-
-            /*
-            https://stackoverflow.com/questions/66452108/keycloak-get-users-returns-403-forbidden
-          The service account associated with your client needs to be allowed to view the realm users.
-          Go to http://localhost:8080/auth/admin/{realm_name}/console/#/realms/{realm_name}/clients
-          Select your client (which must be a confidential client)
-          In the settings tab, switch Service Account Enabled to ON
-          Click on save, the Service Account Roles tab will appear
-          In Client Roles, select realm_management
-          Scroll through available roles until you can select view_users
-          Click on Add selected
-          You should have something like this :
-          */
-
-
-            // ATTENTION You have to add a client scope after as described here: https://keycloak.discourse.group/t/issue-on-userinfo-endpoint-at-keycloak-20/18461/4
-
-            // console.log("this._oauth2", this._oauth2)
-            this._oauth2._useAuthorizationHeaderForGET = true;
-            this._oauth2.get(process.env.OAUTH2_USER_INFO_URL, accessToken, (err, body) => {
-                if (err) {
-                    return done(err);
-                }
-
-                try {
-                    winston.debug("body", body);
-
-                    const json = JSON.parse(body);
-                    const userInfo = {
-                        keycloakId: json.sub,
-                        fullName: json.name,
-                        firstName: json.given_name,
-                        lastName: json.family_name,
-                        username: json.preferred_username,
-                        email: json.email,
-                        // avatar: json.avatar,
-                        // realm: this.options.realm,
-                    };
-                    winston.debug("userInfo", userInfo);
-
-                    done(null, userInfo);
-                } catch (e) {
-                    done(e);
-                }
-            });
-        };
-
+        var OAuth2Strategy = require('passport-oauth2');
+        installOauth2UserProfileOnce(OAuth2Strategy);
 
         passport.use(new OAuth2Strategy({
                 authorizationURL: process.env.OAUTH2_AUTH_URL,
@@ -595,83 +623,95 @@ module.exports = function (passport) {
                 clientID: process.env.OAUTH2_CLIENT_ID,
                 clientSecret: process.env.OAUTH2_CLIENT_SECRET,
                 callbackURL: process.env.OAUTH2_CALLBACK_URL || "http://localhost:3000/auth/oauth2/callback",
-                scope: ['openid'],
+                scope: parseOauth2Scope(),
             },
             function (accessToken, refreshToken, params, profile, cb) {
-                winston.debug("params", params);
+                var idToken = (params && params.id_token) ? jwt.decode(params.id_token) : null;
+                var accessJwt = jwt.decode(accessToken);
+                var issuer = (idToken && idToken.iss) || (accessJwt && accessJwt.iss);
+                var subject = (profile && profile.keycloakId) || (idToken && idToken.sub) || (accessJwt && accessJwt.sub);
+                var email = oauth2NormalizeEmailLike(profile && profile.email);
+                if (!email && idToken) {
+                    email = oauth2NormalizeEmailLike(idToken.email || idToken.preferred_username || idToken.upn);
+                }
 
+                var tenantIdFromToken;
+                if (idToken && idToken.tid != null && String(idToken.tid).trim() !== '') {
+                    tenantIdFromToken = String(idToken.tid).trim();
+                }
 
-                const token = jwt.decode(accessToken); // user id lives in here
-                winston.debug("token", token);
+                if (!issuer) {
+                    winston.warn('OAuth2 sign-in: cannot determine issuer (id_token or access_token JWT iss missing).');
+                    return cb(null, false);
+                }
+                if (!subject) {
+                    winston.warn('OAuth2 sign-in: cannot determine subject (UserInfo sub, id_token.sub, or access_token sub missing).');
+                    return cb(null, false);
+                }
+                if (!email) {
+                    winston.warn('OAuth2 sign-in: no email, preferred_username, or upn in UserInfo or ID token.');
+                    return cb(null, false);
+                }
 
-                const profileInfo = jwt.decode(params.access_token); // user email lives in here
-                winston.debug("profileInfo", profileInfo);
+                var firstname = profile.firstName || profile.fullName || profile.username || 'User';
+                var lastname = profile.lastName || '';
+                var authQuery = {providerId: issuer, subject: subject};
 
-                winston.debug("profile", profile);
+                var oauth2AuthFields = {providerId: issuer, email: email, subject: subject};
+                if (tenantIdFromToken) {
+                    oauth2AuthFields.tenantId = tenantIdFromToken;
+                }
 
-                winston.debug("accessToken", accessToken);
+                winston.debug('OAuth2 verify', {issuer: issuer, subject: subject, email: email, tid: tenantIdFromToken});
 
-                winston.debug("refreshToken", refreshToken);
-
-                var issuer = token.iss;
-                var email = profile.email;
-
-                var query = {providerId: issuer, subject: profile.keycloakId};
-                winston.debug("query", query)
-
-                Auth.findOne(query, function (err, cred) {
-                    winston.debug("cred", cred, err);
+                Auth.findOne(authQuery, function (err, cred) {
                     if (err) {
                         return cb(err);
                     }
                     if (!cred) {
-                        // The oauth account has not logged in to this app before.  Create a
-                        // new user record and link it to the oauth account.
-                        var password = uniqid()
-                        // signup ( email, password, firstname, lastname, emailverified) {
-                        userService.signup(email, password, profileInfo.name || profileInfo.preferred_username, "", true)
-                            .then(function (savedUser) {
-
-                                winston.debug("savedUser", savedUser)
-
-                                var auth = new Auth({
-                                    providerId: issuer,
-                                    email: email,
-                                    subject: profile.keycloakId,
-                                });
-                                auth.save(function (err, authSaved) {
-                                    if (err) {
-                                        return cb(err);
-                                    }
-                                    winston.debug("authSaved", authSaved);
-
-                                    return cb(null, savedUser);
-                                });
-                            }).catch(function (err) {
-                            winston.error("Error signup oauth ", err);
-                            return cb(err);
-                        });
-                    } else {
-                        // The Oauth account has previously logged in to the app.  Get the
-                        // user record linked to the Oauth account and log the user in.
-
                         User.findOne({
                             email: email, status: 100
-                        }, 'email firstname lastname emailverified id', function (err, user) {
-
-                            winston.debug("user", user, err);
-                            // winston.debug("usertoJSON()",user.toJSON());
-
-                            if (err) {
-                                winston.error("Error getting user", user, err);
-                                return cb(err);
+                        }, 'email firstname lastname emailverified id', function (findExistingErr, existingUser) {
+                            if (findExistingErr) {
+                                return cb(findExistingErr);
                             }
-
+                            if (existingUser) {
+                                var linkAuthDoc = new Auth(oauth2AuthFields);
+                                linkAuthDoc.save(function (linkSaveErr) {
+                                    if (linkSaveErr) {
+                                        return cb(linkSaveErr);
+                                    }
+                                    return cb(null, existingUser);
+                                });
+                            } else {
+                                var password = uniqid();
+                                userService.signup(email, password, firstname, lastname, true)
+                                    .then(function (savedUser) {
+                                        var authDoc = new Auth(oauth2AuthFields);
+                                        authDoc.save(function (saveErr) {
+                                            if (saveErr) {
+                                                return cb(saveErr);
+                                            }
+                                            return cb(null, savedUser);
+                                        });
+                                    }).catch(function (signupErr) {
+                                        winston.error("Error signup oauth ", signupErr);
+                                        return cb(signupErr);
+                                    });
+                            }
+                        });
+                    } else {
+                        User.findOne({
+                            email: email, status: 100
+                        }, 'email firstname lastname emailverified id', function (findErr, user) {
+                            if (findErr) {
+                                winston.error("Error getting user", user, findErr);
+                                return cb(findErr);
+                            }
                             if (!user) {
-                                winston.info("User not found", user, err);
+                                winston.info("User not found", user, findErr);
                                 return cb(null, false);
                             }
-
                             return cb(null, user);
                         });
                     }

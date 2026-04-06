@@ -19,6 +19,10 @@ var AuthSchema = new Schema({
      email: {
         type: String,        
      },
+     tenantId: {
+        type: String,
+        required: false
+     },
      password: {
         type: String,
         required: false,
