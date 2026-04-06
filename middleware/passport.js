@@ -89,6 +89,27 @@ function parseOauth2Scope() {
     return String(s).trim().split(/\s+/).filter(Boolean);
 }
 
+/**
+ * Comma-separated Entra directory (tenant) IDs in ALLOWED_ENTRA_TENANTS.
+ * Returns null if unset or empty after trim (allow all tenants).
+ */
+function parseAllowedEntraTenants() {
+    var raw = process.env.ALLOWED_ENTRA_TENANTS;
+    if (raw == null || raw === '') {
+        return null;
+    }
+    if (typeof raw !== 'string' || !String(raw).trim()) {
+        return null;
+    }
+    var parts = String(raw).split(',').map(function (s) {
+        return s.trim().toLowerCase();
+    }).filter(Boolean);
+    if (parts.length === 0) {
+        return null;
+    }
+    return new Set(parts);
+}
+
 function oauth2NormalizeEmailLike(v) {
     if (v === undefined || v === null) {
         return '';
@@ -651,6 +672,15 @@ module.exports = function (passport) {
                 if (!email) {
                     winston.warn('OAuth2 sign-in: no email, preferred_username, or upn in UserInfo or ID token.');
                     return cb(null, false);
+                }
+
+                var allowedEntraTenants = parseAllowedEntraTenants();
+                if (allowedEntraTenants) {
+                    var tidNorm = tenantIdFromToken ? String(tenantIdFromToken).trim().toLowerCase() : '';
+                    if (!tidNorm || !allowedEntraTenants.has(tidNorm)) {
+                        winston.warn('OAuth2 sign-in: tenant not allowed', { tid: tenantIdFromToken });
+                        return cb(null, false);
+                    }
                 }
 
                 var firstname = profile.firstName || profile.fullName || profile.username || 'User';
