@@ -10,6 +10,9 @@ var uniqid = require('uniqid');
 var emailService = require("../services/emailService");
 var pendinginvitation = require("../services/pendingInvitationService");
 var userService = require("../services/userService");
+var projectService = require("../services/projectService");
+var Auth = require("../models/auth");
+var Tenant_project_map = require("../models/tenant_project_map");
 
 var noentitycheck = require('../middleware/noentitycheck');
 
@@ -795,7 +798,82 @@ router.get("/oauth2", function (req, res, next) {
 // router.get('/oauth2',
 //   passport.authenticate('oauth2'));
 
-router.get('/oauth2/callback', passport.authenticate('oauth2', { session: false }), function (req, res) {
+function oauth2NormalizeTenantId(tid) {
+  if (tid == null) {
+    return '';
+  }
+  return String(tid).trim().toLowerCase();
+}
+
+function oauth2RewriteUrlToProjectHome(baseUrl, projectId) {
+  if (!baseUrl || !projectId) {
+    return baseUrl;
+  }
+  var idStr = String(projectId);
+  var fragment = '#/project/' + idStr + '/home';
+  var hashIdx = baseUrl.indexOf('#');
+  if (hashIdx !== -1) {
+    return baseUrl.substring(0, hashIdx) + fragment;
+  }
+  return baseUrl + fragment;
+}
+
+async function oauth2ResolveProvisionedProjectId(user) {
+  if (!user || !user.email) {
+    return null;
+  }
+  var email = String(user.email).trim().toLowerCase();
+  var auths = await Auth.find({
+    email: email,
+    tenantId: { $nin: [null, '', undefined] }
+  })
+    .sort({ updatedAt: -1 })
+    .limit(2)
+    .select('tenantId')
+    .lean()
+    .exec();
+
+  if (!auths.length) {
+    return null;
+  }
+  var tenantIdNorm;
+  if (auths.length >= 2) {
+    var n0 = oauth2NormalizeTenantId(auths[0].tenantId);
+    var n1 = oauth2NormalizeTenantId(auths[1].tenantId);
+    if (n0 !== n1) {
+      return null;
+    }
+    tenantIdNorm = n0;
+  } else {
+    tenantIdNorm = oauth2NormalizeTenantId(auths[0].tenantId);
+  }
+  if (!tenantIdNorm) {
+    return null;
+  }
+
+  var map = await Tenant_project_map.findOne({ tenantId: tenantIdNorm }).exec();
+  if (map && map.id_project) {
+    return map.id_project;
+  }
+
+  var created = await projectService.createAndReturnProjectAndProjectUser('Workspace', user._id, {});
+  var id_project = created.project._id;
+
+  try {
+    await Tenant_project_map.create({ tenantId: tenantIdNorm, id_project: id_project });
+  } catch (e) {
+    if (e && (e.code === 11000 || e.code === 'E11000')) {
+      var again = await Tenant_project_map.findOne({ tenantId: tenantIdNorm }).exec();
+      if (again && again.id_project) {
+        return again.id_project;
+      }
+    }
+    throw e;
+  }
+  return id_project;
+}
+
+router.get('/oauth2/callback', passport.authenticate('oauth2', { session: false }), async function (req, res) {
   winston.debug("'/oauth2/callback: ", req.query);
   winston.debug("/oauth2/callback --> req.session.redirect_url", req.session.redirect_url);
   winston.debug("/oauth2/callback --> req.session.forced_redirect_url", req.session.forced_redirect_url);
@@ -830,18 +908,27 @@ router.get('/oauth2/callback', passport.authenticate('oauth2', { session: false 
 
   let homeurl = "/#/";
 
-  const separator = homeurl.includes('?') ? '&' : '?';
-  var url = dashboard_base_url+homeurl+ separator + "token=JWT "+token;
-
+  var useJwt = !!req.session.forced_redirect_url;
+  var baseUrl = dashboard_base_url + homeurl;
   if (req.session.redirect_url) {
-    const separator = req.session.redirect_url.includes('?') ? '&' : '?';
-    url = req.session.redirect_url+ separator + "token=JWT "+token;
+    baseUrl = req.session.redirect_url;
+  }
+  if (req.session.forced_redirect_url) {
+    baseUrl = req.session.forced_redirect_url;
   }
 
-  if (req.session.forced_redirect_url) {
-    const separator = req.session.forced_redirect_url.includes('?') ? '&' : '?';
-    url = req.session.forced_redirect_url+ separator + "jwt=JWT "+token;  //attention we use jwt= (ionic) instead token=(dashboard) for ionic
+  var projectId = null;
+  try {
+    projectId = await oauth2ResolveProvisionedProjectId(user);
+  } catch (err) {
+    winston.warn('(/oauth2/callback) tenant provisioning failed; using default redirect', err);
   }
+  if (projectId) {
+    baseUrl = oauth2RewriteUrlToProjectHome(baseUrl, projectId);
+  }
+
+  const separator = baseUrl.includes('?') ? '&' : '?';
+  var url = baseUrl + separator + (useJwt ? 'jwt=JWT ' : 'token=JWT ') + token;
 
   winston.debug("(/oauth2/callback) Google Redirect: " + url);
 
