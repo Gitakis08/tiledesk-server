@@ -32,3 +32,10 @@ EXPOSE 3000
 
 CMD [ "npm", "start" ]
 
+
+
+# Pobuca patch: Chat21 SDK raw Authorization header
+# chat21-http-server 0.2.37 accepts the JWT as the raw Authorization header.
+# @chat21/chat21-node-sdk prepends "Bearer ", which causes Unauthorized responses.
+RUN sed -i "s/config.authorization = 'Bearer ' + config.token;/config.authorization = config.token;/" /usr/src/app/node_modules/@chat21/chat21-node-sdk/src/chat21.js \
+ && sed -i "s/config.authorization = 'Bearer ' + token;/config.authorization = token;/" /usr/src/app/node_modules/@chat21/chat21-node-sdk/src/auth.js
