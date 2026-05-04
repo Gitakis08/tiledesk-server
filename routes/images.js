@@ -540,4 +540,85 @@ router.get("/", async (req, res) => {
   // );
   
 
+
+// COMPATIBILITY: CDS legacy bot avatar upload.
+// CDS 1.39.9 still calls PUT /images/users/photo?force=true&bot_id=...
+// Keep this route until CDS is rebuilt to use POST /:projectid/files/users/photo.
+router.put('/users/photo', [passport.authenticate(['basic', 'jwt'], { session: false }), validtoken],
+  uploadAvatar.single('file'), async (req, res, next) => {
+    try {
+      winston.debug("[COMPAT] PUT /images/users/photo");
+
+      if (req.upload_file_already_exists) {
+        winston.warn('Error uploading photo image, file already exists', req.file && req.file.filename);
+        return res.status(409).send({success: false, msg: 'Error uploading photo image, file already exists'});
+      }
+
+      if (!req.file) {
+        return res.status(400).send({ success: false, error: 'No file uploaded' });
+      }
+
+      let userid = req.user.id;
+      let bot_id;
+      let entity_id = userid;
+
+      if (req.query.bot_id) {
+        bot_id = req.query.bot_id;
+
+        let chatbot = await faq_kb.findById(bot_id).catch((err) => {
+          winston.error("Error finding bot ", err);
+          return res.status(500).send({ success: false, error: "Unable to find chatbot with id " + bot_id });
+        });
+
+        if (!chatbot) {
+          return res.status(404).send({ success: false, error: "Chatbot not found" });
+        }
+
+        let id_project = chatbot.id_project;
+
+        let puser = await project_user.findOne({ id_user: userid, id_project: id_project }).catch((err) => {
+          winston.error("Error finding project user: ", err);
+          return res.status(500).send({ success: false, error: "Unable to find project user for user " + userid + " in project " + id_project });
+        });
+
+        if (!puser) {
+          winston.warn("User " + userid + " does not belong to chatbot project " + id_project);
+          return res.status(401).send({ success: false, error: "You do not belong to the chatbot project" });
+        }
+
+        if ((puser.role !== roleConstants.ADMIN) && (puser.role !== roleConstants.OWNER)) {
+          winston.warn("User with role " + puser.role + " cannot modify the chatbot");
+          return res.status(403).send({ success: false, error: "You do not have the role required to modify the chatbot" });
+        }
+
+        entity_id = bot_id;
+      }
+
+      var destinationFolder = 'uploads/users/' + entity_id + "/images/";
+      var thumFilename = destinationFolder + 'thumbnails_200_200-photo.jpg';
+
+      fileService.getFileDataAsBuffer(req.file.filename).then(function(buffer) {
+        sharp(buffer).resize(200, 200).toBuffer((err, resizeImage, info) => {
+          if (err) { winston.error("Error generating thumbnail", err); }
+          fileService.createFile(thumFilename, resizeImage, undefined, undefined);
+        });
+
+        return res.status(201).json({
+          message: 'Image uploaded successfully',
+          filename: encodeURIComponent(req.file.filename),
+          thumbnail: encodeURIComponent(thumFilename)
+        });
+      }).catch((err) => {
+        winston.error("Error reading uploaded file", err);
+        return res.status(500).send({ success: false, error: "Error reading uploaded file" });
+      });
+
+    } catch (error) {
+      winston.error('Error uploading user image.', error);
+      return res.status(500).send({success: false, msg: 'Error uploading user image.'});
+    }
+  }
+);
+
+
 module.exports = router;
